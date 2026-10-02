@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 20
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    
+
     steps:
       - name: Download ZIP project
         run: |
@@ -48,9 +48,6 @@ jobs:
           echo ""
           echo "=== File Type ==="
           file project.zip
-          echo ""
-          echo "=== First Bytes ==="
-          xxd project.zip | head -2
 
       - name: Extract ZIP
         run: |
@@ -72,7 +69,7 @@ jobs:
           echo "=== Mengunci Project Dir ==="
           SUB_DIR_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
           FILE_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
-          
+
           if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
             PROJECT_DIR=$(find project_raw -maxdepth 1 -mindepth 1 -type d | head -n 1)
           else
@@ -80,25 +77,18 @@ jobs:
           fi
           echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
 
-      - name: Cache Gradle
-        uses: actions/cache@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('project_raw/**/*.gradle*', 'project_raw/**/gradle-wrapper.properties') }}
-          restore-keys: |
-            gradle-${{ runner.os }}-
+          distribution: "temurin"
+          java-version: "17"
 
-      - name: Gradle speed config
-        run: |
-          mkdir -p ~/.gradle
-          cat >> ~/.gradle/gradle.properties <<'GPROPS'
-          org.gradle.parallel=true
-          org.gradle.caching=true
-          org.gradle.configureondemand=true
-          org.gradle.jvmargs=-Xmx4g -XX:+UseParallelGC -XX:MaxMetaspaceSize=1g
-          GPROPS
+      - name: Setup Flutter
+        uses: subosito/flutter-action@main
+        with:
+          flutter-version: "3.41.9"
+          channel: "stable"
+          cache: true
 
       - name: Fast mode - skip lint
         if: ${{ github.event.inputs.fast_mode == 'true' }}
@@ -113,19 +103,6 @@ jobs:
             }
           }
           GINIT
-
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: "temurin"
-          java-version: "17"
-
-      - name: Setup Flutter
-        uses: subosito/flutter-action@main
-        with:
-          flutter-version: "3.41.9"
-          channel: "stable"
-          cache: true
 
       - name: Analyze Project Code
         if: ${{ github.event.inputs.only_analyze == 'true' }}
