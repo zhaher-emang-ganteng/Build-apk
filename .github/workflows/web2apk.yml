@@ -16,7 +16,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -207,9 +206,8 @@ jobs:
       - name: Download Icon
         run: |
           mkdir -p myapp/assets/icon
-          sudo apt-get update -y
-          sudo apt-get install -y imagemagick || (sleep 5 && sudo apt-get update -y --fix-missing && sudo apt-get install -y imagemagick)
-          curl -L --retry 3 --connect-timeout 20 --max-time 300 \
+          sudo apt-get install -y imagemagick
+          curl -L \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/octet-stream" \
             "${{ github.event.inputs.icon_url }}" \
