@@ -1,0 +1,129 @@
+name: Build Flutter APK Fast
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL download ZIP project Flutter"
+        required: true
+      tag:
+        description: "Tag build"
+        required: true
+      build_type:
+        description: "debug / release"
+        required: true
+        default: "release"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.caching=true"
+    steps:
+      - name: Checkout (skrip heal)
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Download & extract ZIP
+        run: |
+          set -e
+          curl -sSL --retry 3 \
+            -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
+            -H "Accept: application/octet-stream" \
+            "${{ github.event.inputs.zip_url }}" -o project.zip
+          if ! unzip -tq project.zip > /dev/null 2>&1; then
+            echo "❌ File bukan ZIP valid!"; head -c 600 project.zip; exit 1
+          fi
+          rm -rf project_raw
+          unzip -q project.zip -d project_raw
+          rm -rf project_raw/__MACOSX
+          PUBSPEC=""
+          for f in $(find project_raw -maxdepth 5 -name pubspec.yaml \
+              -not -path '*/.*' -not -path '*/example/*' -not -path '*/build/*' \
+              | awk '{print length, $0}' | sort -n | cut -d' ' -f2-); do
+            if grep -Eq "sdk:[[:space:]]*flutter" "$f"; then PUBSPEC="$f"; break; fi
+            [ -z "$PUBSPEC" ] && FIRST="$f"
+          done
+          [ -z "$PUBSPEC" ] && PUBSPEC="${FIRST:-}"
+          if [ -z "$PUBSPEC" ]; then
+            echo "❌ pubspec.yaml tidak ditemukan di dalam ZIP"
+            find project_raw -maxdepth 3 | head -50
+            exit 1
+          fi
+          echo "PROJECT_DIR=$GITHUB_WORKSPACE/$(dirname "$PUBSPEC")" >> "$GITHUB_ENV"
+          echo "✅ Project Flutter: $(dirname "$PUBSPEC")"
+
+      - name: Detect versi Flutter
+        id: detect
+        run: |
+          FV=$(python3 -I .github/scripts/heal_flutter.py detect-flutter "$PROJECT_DIR")
+          echo "Flutter dipilih: '${FV:-stable terbaru}'"
+          echo "flutter=$FV" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.detect.outputs.flutter }}
+          channel: stable
+          cache: true
+
+      - name: Heal project (android, icon, asset, dll)
+        run: python3 -I .github/scripts/heal_flutter.py heal "$PROJECT_DIR"
+
+      - name: Detect versi Java
+        id: java
+        run: echo "v=$(python3 -I .github/scripts/heal_flutter.py detect-java "$PROJECT_DIR")" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.java.outputs.v }}
+
+      - name: Heal signing
+        run: python3 -I .github/scripts/heal_flutter.py heal-late "$PROJECT_DIR"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-fast-${{ runner.os }}-j${{ steps.java.outputs.v }}-${{ hashFiles('project_raw/**/*.gradle', 'project_raw/**/*.gradle.kts', 'project_raw/**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-fast-${{ runner.os }}-j${{ steps.java.outputs.v }}-
+
+      - name: Get dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter pub get || { echo "⚠️ pub get gagal, ulangi tanpa pubspec.lock"; rm -f pubspec.lock; flutter pub get; }
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          MODE="${{ github.event.inputs.build_type }}"
+          FLAGS="--target-platform android-arm64"
+          [ "$MODE" = "release" ] && FLAGS="$FLAGS --no-tree-shake-icons"
+          if flutter build apk -h 2>/dev/null | grep -q -- "--android-skip-build-dependency-validation"; then
+            FLAGS="$FLAGS --android-skip-build-dependency-validation"
+          fi
+          flutter build apk --$MODE $FLAGS --no-pub
+
+      - name: Kumpulkan APK
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/apk_out"
+          APK=$(find "$PROJECT_DIR" -path '*/build/*' -name '*.apk' ! -name '*unaligned*' -printf '%s %p\n' | sort -rn | head -n 1 | cut -d' ' -f2-)
+          if [ -z "$APK" ]; then echo "❌ File .apk tidak ditemukan setelah build"; exit 1; fi
+          cp "$APK" "$GITHUB_WORKSPACE/apk_out/"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-fast-${{ github.event.inputs.tag }}
+          path: apk_out/*.apk
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
