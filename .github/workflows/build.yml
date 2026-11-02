@@ -21,132 +21,138 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    
+    timeout-minutes: 40
     steps:
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
+      - name: Checkout (skrip heal)
+        uses: actions/checkout@v4
 
-      - name: Download ZIP project
+      - name: Download & extract ZIP
         run: |
-          echo "=== Downloading ZIP ==="
-          echo "URL: ${{ github.event.inputs.zip_url }}"
-
-          curl -L \
+          set -e
+          echo "=== Download ZIP ==="
+          curl -sSL --retry 3 \
             -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
             -H "Accept: application/octet-stream" \
-            "${{ github.event.inputs.zip_url }}" \
-            -o project.zip \
-            -w "\n=== HTTP Status: %{http_code} ===\n=== Final URL: %{url_effective} ===\n"
-
-          echo ""
-          echo "=== File Info ==="
+            "${{ github.event.inputs.zip_url }}" -o project.zip
           ls -lh project.zip
-          echo ""
-          echo "=== File Type ==="
-          file project.zip
-          echo ""
-          echo "=== First Bytes ==="
-          xxd project.zip | head -2
-
-      - name: Extract ZIP
-        run: |
-          echo "=== Validating ZIP ==="
-          if ! unzip -t project.zip > /dev/null 2>&1; then
+          if ! unzip -tq project.zip > /dev/null 2>&1; then
             echo "❌ File bukan ZIP valid!"
-            echo ""
-            echo "=== Isi file ==="
-            cat project.zip
+            head -c 600 project.zip
             exit 1
           fi
-          echo "✅ ZIP valid"
-
-          echo ""
-          echo "=== Extracting ZIP ==="
+          rm -rf project_raw
           unzip -q project.zip -d project_raw
+          rm -rf project_raw/__MACOSX
 
-          echo ""
-          echo "=== Mengunci Project Dir ==="
-          SUB_DIR_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
-          FILE_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
-          
-          if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
-            PROJECT_DIR=$(find project_raw -maxdepth 1 -mindepth 1 -type d | head -n 1)
+          # cari pubspec.yaml milik APLIKASI (yang punya sdk: flutter), bukan paket/contoh
+          PUBSPEC=""
+          for f in $(find project_raw -maxdepth 5 -name pubspec.yaml \
+              -not -path '*/.*' -not -path '*/example/*' -not -path '*/build/*' \
+              | awk '{print length, $0}' | sort -n | cut -d' ' -f2-); do
+            if grep -Eq "sdk:[[:space:]]*flutter" "$f"; then PUBSPEC="$f"; break; fi
+            [ -z "$PUBSPEC" ] && FIRST="$f"
+          done
+          [ -z "$PUBSPEC" ] && PUBSPEC="${FIRST:-}"
+
+          if [ -n "$PUBSPEC" ]; then
+            echo "IS_FLUTTER=true" >> "$GITHUB_ENV"
+            echo "PROJECT_DIR=$GITHUB_WORKSPACE/$(dirname "$PUBSPEC")" >> "$GITHUB_ENV"
+            echo "✅ Project Flutter: $(dirname "$PUBSPEC")"
           else
-            PROJECT_DIR="project_raw"
+            GR=$(find project_raw -maxdepth 5 -name gradlew | head -n 1)
+            if [ -z "$GR" ]; then
+              echo "❌ pubspec.yaml / gradlew tidak ditemukan di dalam ZIP"
+              find project_raw -maxdepth 3 | head -50
+              exit 1
+            fi
+            echo "IS_FLUTTER=false" >> "$GITHUB_ENV"
+            echo "PROJECT_DIR=$GITHUB_WORKSPACE/$(dirname "$GR")" >> "$GITHUB_ENV"
+            echo "✅ Project Gradle/Android: $(dirname "$GR")"
           fi
-          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+
+      - name: Detect versi Flutter
+        id: detect
+        if: env.IS_FLUTTER == 'true'
+        run: |
+          FV=$(python3 -I .github/scripts/heal_flutter.py detect-flutter "$PROJECT_DIR")
+          echo "Flutter dipilih: '${FV:-stable terbaru}'"
+          echo "flutter=$FV" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Flutter
+        if: env.IS_FLUTTER == 'true'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.detect.outputs.flutter }}
+          channel: stable
+          cache: true
+
+      - name: Heal project (android, icon, asset, dll)
+        if: env.IS_FLUTTER == 'true'
+        run: python3 -I .github/scripts/heal_flutter.py heal "$PROJECT_DIR"
+
+      - name: Detect versi Java
+        id: java
+        run: echo "v=$(python3 -I .github/scripts/heal_flutter.py detect-java "$PROJECT_DIR")" >> "$GITHUB_OUTPUT"
 
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: "temurin"
-          java-version: "17"
+          distribution: temurin
+          java-version: ${{ steps.java.outputs.v }}
 
-      - name: Setup Flutter
-        uses: subosito/flutter-action@main
-        with:
-          flutter-version: "3.41.9"
-          channel: "stable"
-          cache: true
+      - name: Heal signing
+        if: env.IS_FLUTTER == 'true'
+        run: python3 -I .github/scripts/heal_flutter.py heal-late "$PROJECT_DIR"
 
       - name: Analyze Project Code
+        if: env.IS_FLUTTER == 'true'
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          if [ -f "pubspec.yaml" ]; then
-            flutter analyze > analyze_report.txt 2>&1 || true
-            echo "[RESULT_ANALYZE]"
-            cat analyze_report.txt
-            echo "[END_RESULT_ANALYZE]"
-            rm -f analyze_report.txt
-          else
-            echo "[RESULT_ANALYZE]"
-            echo "❌ pubspec.yaml tidak ditemukan."
-            echo "[END_RESULT_ANALYZE]"
-          fi
+          flutter pub get > /dev/null 2>&1 || true
+          flutter analyze > analyze_report.txt 2>&1 || true
+          echo "[RESULT_ANALYZE]"
+          cat analyze_report.txt
+          echo "[END_RESULT_ANALYZE]"
+          rm -f analyze_report.txt
 
       - name: Stop if Analyze Only
         if: ${{ github.event.inputs.only_analyze == 'true' }}
         run: exit 1
 
       - name: Get dependencies
+        if: env.IS_FLUTTER == 'true'
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          if [ -f "pubspec.yaml" ]; then
-            timeout 120s flutter pub get || echo "⚠️ Lanjut..."
-          fi
+          flutter pub get || { echo "⚠️ pub get gagal, ulangi tanpa pubspec.lock"; rm -f pubspec.lock; flutter pub get; }
 
       - name: Build APK
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          if [ -f "pubspec.yaml" ]; then
-            flutter build apk --${{ github.event.inputs.build_type }}
-          else
-            GRADLE_PATH=$(find . -name "gradlew" | head -n 1)
-            GRADLE_DIR=$(dirname "$GRADLE_PATH")
-            cd "$GRADLE_DIR" && chmod +x gradlew
-            if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
-              ./gradlew assembleDebug
-            else
-              ./gradlew assembleRelease
+          MODE="${{ github.event.inputs.build_type }}"
+          if [ "$IS_FLUTTER" = "true" ]; then
+            FLAGS=""
+            [ "$MODE" = "release" ] && FLAGS="--no-tree-shake-icons"
+            if flutter build apk -h 2>/dev/null | grep -q -- "--android-skip-build-dependency-validation"; then
+              FLAGS="$FLAGS --android-skip-build-dependency-validation"
             fi
+            flutter build apk --$MODE $FLAGS --no-pub
+          else
+            chmod +x gradlew
+            if [ "$MODE" = "debug" ]; then ./gradlew assembleDebug; else ./gradlew assembleRelease; fi
           fi
 
-      - name: Check APK Output
+      - name: Kumpulkan APK
         run: |
-          APK_FOUND=$(find $GITHUB_WORKSPACE -name "*.apk" | head -n 1)
-          APK_PATH=$(echo "$APK_FOUND" | sed "s|$GITHUB_WORKSPACE/||")
-          echo "PROJECT_DIR=$GITHUB_WORKSPACE" >> $GITHUB_ENV
-          echo "APK_PATH=$APK_PATH" >> $GITHUB_ENV
+          mkdir -p "$GITHUB_WORKSPACE/apk_out"
+          APK=$(find "$PROJECT_DIR" -path '*/build/*' -name '*.apk' ! -name '*unaligned*' -printf '%s %p\n' | sort -rn | head -n 1 | cut -d' ' -f2-)
+          if [ -z "$APK" ]; then echo "❌ File .apk tidak ditemukan setelah build"; exit 1; fi
+          cp "$APK" "$GITHUB_WORKSPACE/apk_out/"
+          ls -lh "$GITHUB_WORKSPACE/apk_out/"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: flutter-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}
-          path: ${{ env.PROJECT_DIR }}/${{ env.APK_PATH }}
+          path: apk_out/*.apk
           retention-days: 1
           if-no-files-found: error
